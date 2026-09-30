@@ -1,8 +1,25 @@
 {
-  "channel_url": "https://www.youtube.com/@KKStudio-PhimienAnh-zy6kh/videos",
-  "max_videos": 100,
-  "catalog_name": "YouTube Movies",
+  "channels": [
+    {
+      "id": "AFILMPhimHay",
+      "name": "AFILMPhimHay",
+      "url": "https://www.youtube.com/@AFILMPhimHay/videos",
+      "limit": 100
+    },
+    {
+      "id": "kkstudio",
+      "name": "KKStudio - Phim điện ảnh",
+      "url": "https://www.youtube.com/@KKStudio-PhimienAnh-zy6kh/videos",
+      "limit": 100
+    },
+    {
+      "id": "OnTopMovies",
+      "name": "OnTopMovies",
+      "url": "https://www.youtube.com/@OnTopMovies-Cinema/videos",
+      "limit": 100
+    }
+  ],
   "cache_seconds": 600,
-  "host": "127.0.0.1",
+  "host": "0.0.0.0",
   "port": 7000
 }

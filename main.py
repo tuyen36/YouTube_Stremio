@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -10,7 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 # =========================================================
-# 1. CAU HINH
+# 1. CẤU HÌNH
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -25,25 +26,87 @@ if not CONFIG_FILE.exists():
 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
 
-CHANNEL_URL = CONFIG.get(
-    "channel_url",
-    "https://www.youtube.com/@GoogleDevelopers/videos"
-).strip()
-
-MAX_VIDEOS = max(1, min(int(CONFIG.get("max_videos", 100)), 500))
-CATALOG_NAME = CONFIG.get("catalog_name", "YouTube Movies")
 CACHE_SECONDS = max(30, int(CONFIG.get("cache_seconds", 600)))
-HOST = CONFIG.get("host", "127.0.0.1")
-PORT = int(CONFIG.get("port", 7000))
+HOST = os.environ.get("HOST", CONFIG.get("host", "0.0.0.0"))
+PORT = int(os.environ.get("PORT", CONFIG.get("port", 7000)))
+
+
+def load_channels(config):
+    """Đọc danh sách kênh từ config.json, có hỗ trợ config cũ."""
+    raw_channels = config.get("channels")
+
+    # Tương thích ngược với config cũ chỉ có 1 kênh
+    if not raw_channels:
+        raw_channels = [
+            {
+                "id": "youtube_videos",
+                "name": config.get("catalog_name", "YouTube Movies"),
+                "url": config.get(
+                    "channel_url",
+                    "https://www.youtube.com/@GoogleDevelopers/videos"
+                ),
+                "limit": config.get("max_videos", 100)
+            }
+        ]
+
+    if not isinstance(raw_channels, list) or not raw_channels:
+        raise ValueError("config.json phai co 'channels' la danh sach khong rong")
+
+    channels = []
+    seen_ids = set()
+
+    for index, item in enumerate(raw_channels):
+        if not isinstance(item, dict):
+            raise ValueError(f"Channel #{index} khong phai object")
+
+        channel_id = str(item.get("id", "")).strip()
+        if not channel_id:
+            raise ValueError(f"Channel #{index} thieu 'id'")
+
+        if channel_id in seen_ids:
+            raise ValueError(f"Trung id kenh: {channel_id}")
+
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", channel_id):
+            raise ValueError(
+                f"id kenh khong hop le: {channel_id}. "
+                "Chi dung chu, so, dau _ va dau -"
+            )
+
+        url = str(item.get("url", "")).strip()
+        if not url:
+            raise ValueError(f"Channel {channel_id} thieu 'url'")
+
+        name = str(item.get("name", channel_id)).strip() or channel_id
+
+        try:
+            limit = int(item.get("limit", 100))
+        except (TypeError, ValueError):
+            limit = 100
+
+        limit = max(1, min(limit, 500))
+
+        channels.append({
+            "id": channel_id,
+            "name": name,
+            "url": url,
+            "limit": limit
+        })
+        seen_ids.add(channel_id)
+
+    return channels
+
+
+CHANNELS = load_channels(CONFIG)
+CHANNELS_BY_ID = {channel["id"]: channel for channel in CHANNELS}
 
 # =========================================================
-# 2. KHOI TAO MAY CHU
+# 2. KHỞI TẠO MÁY CHỦ
 # =========================================================
 
 app = FastAPI(
     title="YouTube Stremio Add-on",
-    version="1.2.0",
-    description="Browse public YouTube videos in Stremio"
+    version="2.0.0",
+    description="Browse public YouTube videos from multiple channels in Stremio"
 )
 
 app.add_middleware(
@@ -65,18 +128,19 @@ logger = logging.getLogger("youtube_stremio")
 
 MANIFEST = {
     "id": "org.tuyen.youtube.stremio",
-    "version": "1.2.0",
-    "name": "YouTube Channel",
-    "description": "Browse public YouTube videos",
+    "version": "2.0.0",
+    "name": "YouTube Channels",
+    "description": "Browse public YouTube videos from multiple channels",
     "resources": ["catalog", "meta", "stream"],
     "types": ["movie"],
     "idPrefixes": ["yt_"],
     "catalogs": [
         {
             "type": "movie",
-            "id": "youtube_videos",
-            "name": CATALOG_NAME
+            "id": channel["id"],
+            "name": channel["name"]
         }
+        for channel in CHANNELS
     ],
     "behaviorHints": {
         "configurable": False,
@@ -85,16 +149,16 @@ MANIFEST = {
 }
 
 # =========================================================
-# 4. CACHE DANH SACH VIDEO
+# 4. CACHE DANH SÁCH VIDEO THEO TỪNG KÊNH
 # =========================================================
 
-video_cache = []
-cache_time = 0
+video_cache = {}
+cache_time = {}
 cache_lock = Lock()
 
 
 def extract_video_id(item):
-    """Lay ma video YouTube tu du lieu yt-dlp."""
+    """Lấy mã video YouTube từ dữ liệu yt-dlp."""
     video_id = item.get("id")
 
     if not video_id:
@@ -112,79 +176,105 @@ def extract_video_id(item):
     return video_id
 
 
-def get_video_list(force=False):
-    """Lay danh sach video, su dung cache de giam truy van."""
-    global video_cache, cache_time
+def get_video_list(channel_id, force=False):
+    """Lấy danh sách video của một kênh, có cache riêng."""
+    channel = CHANNELS_BY_ID.get(channel_id)
+
+    if channel is None:
+        raise KeyError(f"Khong tim thay kenh: {channel_id}")
+
+    now = time.time()
 
     with cache_lock:
+        cached = video_cache.get(channel_id)
+        cached_at = cache_time.get(channel_id, 0)
+
         if (
             not force
-            and video_cache
-            and time.time() - cache_time < CACHE_SECONDS
+            and cached is not None
+            and now - cached_at < CACHE_SECONDS
         ):
-            return video_cache
+            return cached
 
-        options = {
-            "extract_flat": True,
-            "playlistend": MAX_VIDEOS,
-            "ignoreerrors": True,
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True
-        }
+    options = {
+        "extract_flat": True,
+        "playlistend": channel["limit"],
+        "ignoreerrors": True,
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True
+    }
 
-        try:
-            logger.info("Dang lay danh sach: %s", CHANNEL_URL)
+    try:
+        logger.info(
+            "Dang lay danh sach kenh %s (%s): %s",
+            channel["id"],
+            channel["name"],
+            channel["url"]
+        )
 
-            with yt_dlp.YoutubeDL(options) as ydl:
-                info = ydl.extract_info(CHANNEL_URL, download=False)
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(channel["url"], download=False)
 
-            entries = info.get("entries") or []
-            result = []
+        entries = info.get("entries") or []
+        result = []
 
-            for item in entries:
-                if not item:
-                    continue
+        for item in entries:
+            if not item:
+                continue
 
-                video_id = extract_video_id(item)
-                if not video_id:
-                    continue
+            video_id = extract_video_id(item)
+            if not video_id:
+                continue
 
-                title = item.get("title") or "YouTube video"
-                thumbnail = item.get("thumbnail") or (
-                    "https://i.ytimg.com/vi/"
-                    + video_id
-                    + "/hqdefault.jpg"
-                )
+            title = item.get("title") or "YouTube video"
+            thumbnail = item.get("thumbnail") or (
+                f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+            )
 
-                result.append({
-                    "id": video_id,
-                    "name": title,
-                    "poster": thumbnail,
-                    "description": item.get("description") or "",
-                    "duration": item.get("duration"),
-                    "url": "https://www.youtube.com/watch?v=" + video_id
-                })
+            result.append({
+                "id": video_id,
+                "name": title,
+                "poster": thumbnail,
+                "description": item.get("description") or "",
+                "duration": item.get("duration"),
+                "url": "https://www.youtube.com/watch?v=" + video_id
+            })
 
-            video_cache = result
-            cache_time = time.time()
+        with cache_lock:
+            video_cache[channel_id] = result
+            cache_time[channel_id] = time.time()
 
-            logger.info("Da nap thanh cong %d video", len(result))
-            return video_cache
+        logger.info(
+            "Kenh %s: da nap %d video",
+            channel_id,
+            len(result)
+        )
+        return result
 
-        except Exception:
-            logger.exception("Khong the lay danh sach YouTube")
-            if video_cache:
-                logger.warning("Su dung danh sach cache cu")
-                return video_cache
-            raise
+    except Exception:
+        logger.exception(
+            "Khong the lay danh sach YouTube cho kenh %s",
+            channel_id
+        )
+
+        with cache_lock:
+            cached = video_cache.get(channel_id)
+
+        if cached is not None:
+            logger.warning("Su dung cache cu cho kenh %s", channel_id)
+            return cached
+
+        raise
 
 
 def find_video(video_id):
-    """Tim video theo ma YouTube."""
-    for video in get_video_list():
-        if video["id"] == video_id:
-            return video
+    """Tìm video trong cache của tất cả kênh."""
+    with cache_lock:
+        for videos in video_cache.values():
+            for video in videos:
+                if video["id"] == video_id:
+                    return video
     return None
 
 
@@ -198,13 +288,19 @@ def manifest():
 
 
 # =========================================================
-# 6. CATALOG ENDPOINT
+# 6. CATALOG ENDPOINT THEO TỪNG KÊNH
 # =========================================================
 
-@app.get("/catalog/movie/youtube_videos.json")
-def catalog():
+@app.get("/catalog/movie/{catalog_id}.json")
+def catalog(catalog_id: str):
+    if catalog_id not in CHANNELS_BY_ID:
+        raise HTTPException(
+            status_code=404,
+            detail="Khong tim thay danh muc"
+        )
+
     try:
-        videos = get_video_list()
+        videos = get_video_list(catalog_id)
     except Exception:
         raise HTTPException(
             status_code=503,
@@ -227,6 +323,7 @@ def catalog():
             seconds = int(duration)
             hours, remainder = divmod(seconds, 3600)
             minutes, secs = divmod(remainder, 60)
+
             item["runtime"] = (
                 f"{hours}:{minutes:02d}:{secs:02d}"
                 if hours else f"{minutes}:{secs:02d}"
@@ -244,11 +341,18 @@ def catalog():
 @app.get("/meta/movie/{item_id}.json")
 def meta(item_id: str):
     if not item_id.startswith("yt_"):
-        raise HTTPException(status_code=404, detail="Khong tim thay video")
+        raise HTTPException(
+            status_code=404,
+            detail="Khong tim thay video"
+        )
 
     video_id = item_id[3:]
+
     if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
-        raise HTTPException(status_code=404, detail="Ma video khong hop le")
+        raise HTTPException(
+            status_code=404,
+            detail="Ma video khong hop le"
+        )
 
     try:
         video = find_video(video_id)
@@ -259,11 +363,7 @@ def meta(item_id: str):
         video = {
             "id": video_id,
             "name": "YouTube video " + video_id,
-            "poster": (
-                "https://i.ytimg.com/vi/"
-                + video_id
-                + "/hqdefault.jpg"
-            ),
+            "poster": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
             "description": ""
         }
 
@@ -289,17 +389,22 @@ def meta(item_id: str):
 # =========================================================
 # 8. STREAM ENDPOINT
 # =========================================================
-# Su dung ytId de Stremio xu ly video YouTube.
-# Khong goi yt-dlp va khong trich xuat URL luong tai day.
 
 @app.get("/stream/movie/{item_id}.json")
 def stream(item_id: str):
     if not item_id.startswith("yt_"):
-        raise HTTPException(status_code=404, detail="Khong tim thay video")
+        raise HTTPException(
+            status_code=404,
+            detail="Khong tim thay video"
+        )
 
     video_id = item_id[3:]
+
     if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
-        raise HTTPException(status_code=404, detail="Ma video khong hop le")
+        raise HTTPException(
+            status_code=404,
+            detail="Ma video khong hop le"
+        )
 
     logger.info("Tra ve YouTube ytId: %s", video_id)
 
@@ -315,17 +420,24 @@ def stream(item_id: str):
 
 
 # =========================================================
-# 9. TRANG KIEM TRA
+# 9. TRANG KIỂM TRA
 # =========================================================
 
 @app.get("/")
 def home():
     return {
         "name": "YouTube Stremio Add-on",
-        "version": "1.2.0",
+        "version": MANIFEST["version"],
         "status": "running",
         "manifest": "/manifest.json",
-        "catalog": "/catalog/movie/youtube_videos.json"
+        "channels": [
+            {
+                "id": channel["id"],
+                "name": channel["name"],
+                "catalog": f"/catalog/movie/{channel['id']}.json"
+            }
+            for channel in CHANNELS
+        ]
     }
 
 
@@ -333,12 +445,12 @@ def home():
 def health():
     return {
         "status": "ok",
-        "version": "1.2.0"
+        "version": MANIFEST["version"]
     }
 
 
 # =========================================================
-# 10. KHOI DONG MAY CHU
+# 10. KHỞI ĐỘNG MÁY CHỦ
 # =========================================================
 
 if __name__ == "__main__":
