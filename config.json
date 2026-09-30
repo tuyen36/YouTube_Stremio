@@ -1,0 +1,8 @@
+{
+  "channel_url": "https://www.youtube.com/@KKStudio-PhimienAnh-zy6kh/videos",
+  "max_videos": 100,
+  "catalog_name": "YouTube Movies",
+  "cache_seconds": 600,
+  "host": "127.0.0.1",
+  "port": 7000
+}
